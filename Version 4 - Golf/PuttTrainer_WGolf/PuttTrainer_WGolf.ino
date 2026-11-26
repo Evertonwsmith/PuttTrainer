@@ -1,6 +1,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <math.h>
+#include <stdint.h>
 
 const char* AP_SSID = "IR-Sensors";
 const char* AP_PASS = "12345678";
@@ -17,13 +18,21 @@ const bool BROKEN_IS_LOW = true;
 // Setup hold time in milliseconds (sensors 2 & 3 both broken)
 const unsigned long SETUP_HOLD_MS = 2000;
 
-// === PHYSICAL GEOMETRY (SET THESE IN METERS TO MATCH YOUR TRIANGLE) ===
+// === PHYSICAL GEOMETRY & COLLISION PARAMETERS ===
 const float DIST_S1_TO_S2_M = 0.20f; // Distance from Sensor 1 to Sensor 2 (m)
 const float DIST_S1_TO_S3_M = 0.20f; // Distance from Sensor 1 to Sensor 3 (m)
 const float SPACING_S2_S3_M = 0.12f; // Spacing between Sensor 2 and Sensor 3 (m)
 
-// Reference launch speed for Stimpmeter roll scaling (~6.0 ft/s = 1.8288 m/s)
-const float STIMP_REF_SPEED_MPS = 1.8288f;
+const float PUTTER_MASS_KG = 0.350f;   // Effective putter head mass (kg)
+const float BALL_MASS_KG = 0.04593f;   // Standard USGA golf ball mass (kg)
+const float COR_PUTTER_BALL = 0.80f;   // Coefficient of restitution (0.0 to 1.0)
+
+// Guardrails against sensor bounce/glitches causing extreme speed/roll values
+const float MIN_STROKE_MS = 25.0f;     // Minimum plausible S1 -> S2/S3 time (ms)
+const float MAX_ROLL_FEET = 120.0f;    // Maximum displayed roll cap (ft)
+
+// Reference ball speed for Stimpmeter roll scaling (~6.0 ft/s = 1.8288 m/s)
+const float STIMP_REF_BALL_SPEED_MPS = 1.8288f;
 const float FEET_PER_METER = 3.28084f;
 const float METERS_PER_FOOT = 0.3048f;
 
@@ -66,8 +75,10 @@ float dtS1ToS2Ms = 0.0f;
 float dtS1ToS3Ms = 0.0f;
 float dtS3MinusS2Ms = 0.0f;
 
-float speedMps = 0.0f;
-float speedFps = 0.0f;
+float putterSpeedMps = 0.0f;
+float ballSpeedMps = 0.0f;
+float ballSpeedFps = 0.0f;
+float ballEnergyMj = 0.0f;
 
 // Signed angle in degrees: positive => Left (Sensor 3 before Sensor 2), negative => Right
 float signedAngleDeg = 0.0f;
@@ -100,16 +111,25 @@ bool readSensorBroken(int index) {
   return BROKEN_IS_LOW ? (val == LOW) : (val == HIGH);
 }
 
-void recomputeRollFromSpeed() {
-  if (!hasPuttData || speedMps <= 0.0f) {
+float getTransferGain() {
+  float denom = PUTTER_MASS_KG + BALL_MASS_KG;
+  if (denom <= 0.0f) return 1.0f;
+  return (PUTTER_MASS_KG * (1.0f + COR_PUTTER_BALL)) / denom;
+}
+
+void recomputeRollFromBallSpeed() {
+  if (!hasPuttData || ballSpeedMps <= 0.0f) {
     rollMeters = 0.0f;
     rollFeet = 0.0f;
     return;
   }
   float baseRollMeters = (float)stimpRating * METERS_PER_FOOT;
-  float speedRatio = speedMps / STIMP_REF_SPEED_MPS;
-  rollMeters = baseRollMeters * speedRatio * speedRatio;
-  rollFeet = rollMeters * FEET_PER_METER;
+  float speedRatio = ballSpeedMps / STIMP_REF_BALL_SPEED_MPS;
+  float rawFeet = (baseRollMeters * speedRatio * speedRatio) * FEET_PER_METER;
+  if (rawFeet > MAX_ROLL_FEET) rawFeet = MAX_ROLL_FEET;
+  if (rawFeet < 0.0f) rawFeet = 0.0f;
+  rollFeet = rawFeet;
+  rollMeters = rollFeet * METERS_PER_FOOT;
 }
 
 void prepareStrokeCapture() {
@@ -154,8 +174,10 @@ void resetMachine() {
   dtS1ToS2Ms = 0.0f;
   dtS1ToS3Ms = 0.0f;
   dtS3MinusS2Ms = 0.0f;
-  speedMps = 0.0f;
-  speedFps = 0.0f;
+  putterSpeedMps = 0.0f;
+  ballSpeedMps = 0.0f;
+  ballSpeedFps = 0.0f;
+  ballEnergyMj = 0.0f;
   signedAngleDeg = 0.0f;
   angleMagDeg = 0.0f;
   angleDir = "SQUARE";
@@ -188,8 +210,10 @@ String buildStatusJson() {
   json += "\"stimp\":" + String(stimpRating) + ",";
   json += "\"puttLengthFt\":" + String(puttLengthFeet) + ",";
   json += "\"hasPutt\":" + String(hasPuttData ? "true" : "false") + ",";
-  json += "\"speedMps\":" + String(speedMps, 3) + ",";
-  json += "\"speedFps\":" + String(speedFps, 3) + ",";
+  json += "\"putterSpeedMps\":" + String(putterSpeedMps, 3) + ",";
+  json += "\"ballSpeedMps\":" + String(ballSpeedMps, 3) + ",";
+  json += "\"ballSpeedFps\":" + String(ballSpeedFps, 3) + ",";
+  json += "\"ballEnergyMj\":" + String(ballEnergyMj, 2) + ",";
   json += "\"signedAngleDeg\":" + String(signedAngleDeg, 2) + ",";
   json += "\"angleMagDeg\":" + String(angleMagDeg, 2) + ",";
   json += "\"angleDir\":\"" + angleDir + "\",";
@@ -236,7 +260,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     .app-shell {
       max-width: 860px;
       margin: 0 auto;
-      min-height: calc(100dvh - 16px);
       display: flex;
       flex-direction: column;
       gap: 8px;
@@ -348,20 +371,39 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     .log-panel {
       background: var(--turf-deep);
       border: 3px solid var(--cream);
-      padding: 8px 10px;
-      margin-top: 6px;
     }
-    .log-label {
-      font-size: 0.76rem;
+    .log-toggle {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      width: 100%;
+      background: var(--panel-green);
+      color: #102418;
+      border: none;
+      padding: 8px 10px;
+      font-family: inherit;
+      font-size: 0.85rem;
       font-weight: bold;
-      color: var(--cream-soft);
-      margin-bottom: 4px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+    .log-toggle:hover {
+      background: var(--turf-bright);
+    }
+    .log-body {
+      display: none;
+      padding: 8px;
+      border-top: 3px solid var(--cream);
+    }
+    .log-body.open {
+      display: block;
     }
     #log {
       background: #1b4332;
       border: 2px solid var(--cream-soft);
       padding: 8px;
-      height: 140px;
+      height: 150px;
       overflow-y: auto;
       white-space: pre-wrap;
       font-size: 0.78rem;
@@ -402,29 +444,53 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       </div>
       <canvas id="greenCanvas" width="800" height="270"></canvas>
     </div>
-  </div>
 
-  <div class="app-shell">
     <div class="log-panel">
-      <div class="log-label">LOG</div>
-      <div id="log">Waiting...</div>
+      <button id="logToggleBtn" class="log-toggle" type="button" aria-expanded="false" onclick="toggleLog()">
+        <span>SYSTEM LOG</span>
+        <span id="logToggleIcon">[+]</span>
+      </button>
+      <div id="logBody" class="log-body">
+        <div id="log">Waiting...</div>
+      </div>
     </div>
   </div>
 
   <script>
     let userSelectingStimp = false;
     let userDraggingLength = false;
+    let logOpen = false;
 
     let currentState = {
       state: 'SETUP',
       stimp: 10,
       puttLengthFt: 18,
       hasPutt: false,
+      putterSpeedMps: 0,
+      ballSpeedMps: 0,
+      ballSpeedFps: 0,
+      ballEnergyMj: 0,
       signedAngleDeg: 0,
       angleMagDeg: 0,
       angleDir: 'SQUARE',
       rollFeet: 0
     };
+
+    function toggleLog() {
+      logOpen = !logOpen;
+      const body = document.getElementById('logBody');
+      const icon = document.getElementById('logToggleIcon');
+      const btn = document.getElementById('logToggleBtn');
+      const logBox = document.getElementById('log');
+
+      body.classList.toggle('open', logOpen);
+      icon.textContent = logOpen ? '[-]' : '[+]';
+      btn.setAttribute('aria-expanded', logOpen ? 'true' : 'false');
+
+      if (logOpen) {
+        logBox.scrollTop = logBox.scrollHeight;
+      }
+    }
 
     function onLengthInput(val) {
       userDraggingLength = true;
@@ -471,7 +537,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       const w = canvas.width;
       const h = canvas.height;
 
-      // Retro mowed grass stripes
       const stripeCount = 8;
       const stripeW = w / stripeCount;
       for (let i = 0; i < stripeCount; i++) {
@@ -479,24 +544,26 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         ctx.fillRect(Math.floor(i * stripeW), 0, Math.ceil(stripeW), h);
       }
 
-      // Retro border
       ctx.strokeStyle = '#f4f9f4';
       ctx.lineWidth = 4;
       ctx.strokeRect(4, 4, w - 8, h - 8);
 
+      const targetFt = Math.max(1, Number(currentState.puttLengthFt) || 18);
+      const rollFt = (currentState.hasPutt && currentState.rollFeet > 0) ? Number(currentState.rollFeet) : 0;
+
+      const viewMaxFeet = Math.max(targetFt * 1.15, rollFt * 1.15, 10);
+      const topMarginPx = 42;
+      const bottomMarginPx = 28;
+      const usableHeightPx = h - topMarginPx - bottomMarginPx;
+      const pxPerFoot = usableHeightPx / viewMaxFeet;
+
+      const startY = h - bottomMarginPx;
       const holeX = Math.floor(w * 0.5);
-      const holeY = 54;
-      const startY = h - 42;
-      const spanPx = startY - holeY;
+      const holeY = startY - targetFt * pxPerFoot;
 
-      // Scale feet to pixels based on selected putt length (with headroom if roll goes past hole)
-      const maxScaleFeet = Math.max(Number(currentState.puttLengthFt) * 1.15, 10);
-      const pxPerFoot = spanPx / Number(currentState.puttLengthFt);
-
-      // Center aim line (dashed)
       ctx.save();
       ctx.setLineDash([8, 8]);
-      ctx.strokeStyle = 'rgba(244, 249, 244, 0.55)';
+      ctx.strokeStyle = 'rgba(244, 249, 244, 0.6)';
       ctx.lineWidth = 2;
       ctx.beginPath();
       ctx.moveTo(holeX, startY);
@@ -504,50 +571,44 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       ctx.stroke();
       ctx.restore();
 
-      // Cup / Hole
       ctx.fillStyle = '#1b4332';
       ctx.beginPath();
-      ctx.arc(holeX, holeY, 10, 0, Math.PI * 2);
+      ctx.arc(holeX, holeY, 9, 0, Math.PI * 2);
       ctx.fill();
       ctx.strokeStyle = '#f4f9f4';
       ctx.lineWidth = 2;
       ctx.stroke();
 
-      // Retro Flagpole & Flag
       ctx.strokeStyle = '#f4f9f4';
       ctx.lineWidth = 3;
       ctx.beginPath();
       ctx.moveTo(holeX, holeY);
-      ctx.lineTo(holeX, holeY - 34);
+      ctx.lineTo(holeX, holeY - 30);
       ctx.stroke();
 
       ctx.fillStyle = '#f2c94c';
       ctx.beginPath();
-      ctx.moveTo(holeX + 1, holeY - 34);
-      ctx.lineTo(holeX + 24, holeY - 27);
-      ctx.lineTo(holeX + 1, holeY - 20);
+      ctx.moveTo(holeX + 1, holeY - 30);
+      ctx.lineTo(holeX + 22, holeY - 24);
+      ctx.lineTo(holeX + 1, holeY - 18);
       ctx.closePath();
       ctx.fill();
       ctx.strokeStyle = '#1b4332';
       ctx.lineWidth = 1.5;
       ctx.stroke();
 
-      // Ball position calculation
       let ballX = holeX;
       let ballY = startY;
-      let distRemainingFt = Number(currentState.puttLengthFt);
+      let distRemainingFt = targetFt;
 
-      if (currentState.hasPutt && currentState.rollFeet > 0) {
-        const rollPx = Math.min(currentState.rollFeet * pxPerFoot, spanPx + 24);
-        // signedAngleDeg > 0 means Left (-X); < 0 means Right (+X)
-        const angleRad = (currentState.signedAngleDeg * Math.PI) / 180;
-        const dx = -Math.sin(angleRad) * rollPx;
-        const dy = -Math.cos(angleRad) * rollPx;
+      if (currentState.hasPutt && rollFt > 0) {
+        const angleRad = (Number(currentState.signedAngleDeg) * Math.PI) / 180;
+        const forwardFt = rollFt * Math.cos(angleRad);
+        const lateralFt = rollFt * Math.sin(angleRad);
 
-        ballX = Math.max(24, Math.min(w - 24, holeX + dx));
-        ballY = Math.max(22, Math.min(h - 16, startY + dy));
+        ballX = holeX - lateralFt * pxPerFoot;
+        ballY = startY - forwardFt * pxPerFoot;
 
-        // Draw putt path trail
         ctx.strokeStyle = '#f2c94c';
         ctx.lineWidth = 3;
         ctx.beginPath();
@@ -555,14 +616,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         ctx.lineTo(ballX, ballY);
         ctx.stroke();
 
-        // Remaining distance from final ball position to hole
-        const targetFt = Number(currentState.puttLengthFt);
-        const lateralFt = currentState.rollFeet * Math.sin(angleRad);
-        const forwardRemainingFt = targetFt - currentState.rollFeet * Math.cos(angleRad);
-        distRemainingFt = Math.sqrt(forwardRemainingFt * forwardRemainingFt + lateralFt * lateralFt);
+        const dForwardFt = targetFt - forwardFt;
+        distRemainingFt = Math.sqrt(dForwardFt * dForwardFt + lateralFt * lateralFt);
       }
 
-      // Draw Golf Ball
       ctx.fillStyle = '#f4f9f4';
       ctx.beginPath();
       ctx.arc(ballX, ballY, 8, 0, Math.PI * 2);
@@ -578,10 +635,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           ? '0.0° SQ'
           : currentState.angleMagDeg.toFixed(1) + '° ' + currentState.angleDir.toUpperCase();
         document.getElementById('puttSummary').textContent =
-          'ROLL: ' + currentState.rollFeet.toFixed(1) + ' FT | ' + angTxt;
+          'ROLL: ' + rollFt.toFixed(1) + ' FT | ' + angTxt;
       } else {
         document.getElementById('puttSummary').textContent =
-          'TARGET: ' + Number(currentState.puttLengthFt).toFixed(0) + ' FT';
+          'TARGET: ' + targetFt.toFixed(0) + ' FT';
       }
     }
 
@@ -608,7 +665,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
         const logBox = document.getElementById('log');
         logBox.textContent = d.logs.join('\n');
-        logBox.scrollTop = logBox.scrollHeight;
+        if (logOpen) {
+          logBox.scrollTop = logBox.scrollHeight;
+        }
       } catch (e) {}
     }
 
@@ -647,7 +706,7 @@ void handleStimp() {
       }
     }
     stimpRating = best;
-    recomputeRollFromSpeed();
+    recomputeRollFromBallSpeed();
     pushLog("Stimpmeter set to " + String(stimpRating));
   }
   server.send(200, "application/json", "{\"stimp\":" + String(stimpRating) + "}");
@@ -671,33 +730,36 @@ void finalizePutt() {
   dtS1ToS3Ms = s3Recorded ? ((tS3BreakUs - tS1BreakUs) / 1000.0f) : 0.0f;
 
   if (s2Recorded && s3Recorded) {
-    long diffS3MinusS2Us = (long)tS3BreakUs - (long)tS2BreakUs;
-    dtS3MinusS2Ms = diffS3MinusS2Us / 1000.0f;
+    int64_t diffS3MinusS2Us = (int64_t)tS3BreakUs - (int64_t)tS2BreakUs;
+    dtS3MinusS2Ms = (float)(diffS3MinusS2Us / 1000.0);
   } else {
     dtS3MinusS2Ms = 0.0f;
   }
 
-  float v12 = (s2Recorded && dtS1ToS2Ms > 0.0f && DIST_S1_TO_S2_M > 0.0f)
+  float v12 = (s2Recorded && dtS1ToS2Ms >= MIN_STROKE_MS && DIST_S1_TO_S2_M > 0.0f)
                 ? (DIST_S1_TO_S2_M / (dtS1ToS2Ms / 1000.0f))
                 : 0.0f;
-  float v13 = (s3Recorded && dtS1ToS3Ms > 0.0f && DIST_S1_TO_S3_M > 0.0f)
+  float v13 = (s3Recorded && dtS1ToS3Ms >= MIN_STROKE_MS && DIST_S1_TO_S3_M > 0.0f)
                 ? (DIST_S1_TO_S3_M / (dtS1ToS3Ms / 1000.0f))
                 : 0.0f;
 
   if (v12 > 0.0f && v13 > 0.0f) {
-    speedMps = 0.5f * (v12 + v13);
+    putterSpeedMps = 0.5f * (v12 + v13);
   } else if (v12 > 0.0f) {
-    speedMps = v12;
+    putterSpeedMps = v12;
   } else if (v13 > 0.0f) {
-    speedMps = v13;
+    putterSpeedMps = v13;
   } else {
-    speedMps = 0.0f;
+    putterSpeedMps = 0.0f;
   }
 
-  speedFps = speedMps * FEET_PER_METER;
+  float transferGain = getTransferGain();
+  ballSpeedMps = putterSpeedMps * transferGain;
+  ballSpeedFps = ballSpeedMps * FEET_PER_METER;
+  ballEnergyMj = 0.5f * BALL_MASS_KG * ballSpeedMps * ballSpeedMps * 1000.0f;
 
-  if (s2Recorded && s3Recorded && speedMps > 0.0f && SPACING_S2_S3_M > 0.0f) {
-    float lateralOffsetM = speedMps * (-dtS3MinusS2Ms / 1000.0f);
+  if (s2Recorded && s3Recorded && putterSpeedMps > 0.0f && SPACING_S2_S3_M > 0.0f) {
+    float lateralOffsetM = putterSpeedMps * (-dtS3MinusS2Ms / 1000.0f);
     signedAngleDeg = atan2f(lateralOffsetM, SPACING_S2_S3_M) * (180.0f / (float)M_PI);
     angleMagDeg = fabsf(signedAngleDeg);
 
@@ -715,13 +777,14 @@ void finalizePutt() {
   }
 
   hasPuttData = true;
-  recomputeRollFromSpeed();
+  recomputeRollFromBallSpeed();
 
   state = STATE_PUTT_CAPTURED;
 
-  String summary = "Putt captured | Speed: " + String(speedMps, 2) + " m/s | Angle: " +
-                   String(angleMagDeg, 1) + " deg " + angleDir + " | Roll: " +
-                   String(rollFeet, 1) + " ft (Stimp " + String(stimpRating) + ")";
+  String summary = "Putt captured | Putter: " + String(putterSpeedMps, 2) + " m/s | Ball: " +
+                   String(ballSpeedFps, 2) + " ft/s (" + String(ballEnergyMj, 1) +
+                   " mJ) | Angle: " + String(angleMagDeg, 1) + " deg " + angleDir +
+                   " | Roll: " + String(rollFeet, 1) + " ft (Stimp " + String(stimpRating) + ")";
   pushLog(summary);
 }
 
